@@ -46,7 +46,7 @@ jobs:
           - os: macos-latest
             target: bun-darwin-arm64
             name: lmv-darwin-arm64
-          - os: macos-13
+          - os: macos-latest
             target: bun-darwin-x64
             name: lmv-darwin-x64
           - os: ubuntu-latest
