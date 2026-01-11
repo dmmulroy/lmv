@@ -19,7 +19,9 @@ function isGlobPattern(input: string) {
 function isHiddenPath(pathLike: string) {
   const normalized = toPosixPath(pathLike);
   const parts = normalized.split("/").filter(Boolean);
-  return parts.some((part) => part.startsWith("."));
+  return parts.some(
+    (part) => part.startsWith(".") && part !== "." && part !== ".."
+  );
 }
 
 function isMarkdownPath(pathLike: string) {

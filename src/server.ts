@@ -72,7 +72,7 @@ export function startServer(config: StartServerConfig, port: number = 3000) {
     toPosixPath(p)
       .split("/")
       .filter(Boolean)
-      .some((seg) => seg.startsWith("."));
+      .some((seg) => seg.startsWith(".") && seg !== "." && seg !== "..");
 
   const isMarkdownPath = (p: string) => {
     const lower = p.toLowerCase();
