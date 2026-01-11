@@ -1,5 +1,8 @@
-import { resolve, basename, extname } from "path";
+import { basename, dirname, relative, resolve } from "path";
+import { lstat, stat } from "fs/promises";
+import { watch } from "fs";
 import index from "./index.html";
+import { discoverMarkdownFiles } from "./lib/file-discovery";
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
@@ -8,45 +11,234 @@ interface GistResponse {
   id: string;
 }
 
-type FileValidation = { path: string; filename: string } | { error: string };
+export type StartServerConfig = {
+  cwd: string;
+  files: string[]; // absolute paths
+  inputs: string[];
+  recursive: boolean;
+  includeHidden: boolean;
+};
 
-function validateFilePath(filePath: string | null): FileValidation {
-  if (!filePath) {
-    return { error: "No file specified" };
-  }
+type ApiFile = {
+  path: string; // posix-ish, relative to config.cwd
+  name: string;
+  mtimeMs?: number;
+  isSymlink?: boolean;
+  error?: string;
+};
 
-  const absolutePath = resolve(filePath);
-  const ext = extname(absolutePath).toLowerCase();
-
-  if (ext !== ".md" && ext !== ".markdown") {
-    return { error: "Only .md and .markdown files are supported" };
-  }
-
-  return { path: absolutePath, filename: basename(absolutePath) };
+function toPosixPath(p: string) {
+  return p.replaceAll("\\", "/");
 }
 
-function getFileParam(req: Request): string | null {
-  const url = new URL(req.url);
-  return url.searchParams.get("file");
+function buildAllowedFiles(cwd: string, files: Iterable<string>) {
+  const allowed = new Map<string, string>();
+  for (const abs of files) {
+    const rel = toPosixPath(relative(cwd, abs));
+    if (!allowed.has(rel)) allowed.set(rel, abs);
+  }
+  return allowed;
 }
 
-export function startServer(port: number = 3000) {
+export function startServer(config: StartServerConfig, port: number = 3000) {
+  let absoluteFiles = new Set<string>(config.files);
+  let allowedFiles = buildAllowedFiles(config.cwd, absoluteFiles);
+  let singleFile = allowedFiles.size === 1;
+  let pendingRefresh = false;
+
+  const encoder = new TextEncoder();
+  const sseClients = new Set<ReadableStreamDefaultController<Uint8Array>>();
+
+  const broadcast = (event: string, data: unknown) => {
+    const payload =
+      `event: ${event}\n` + `data: ${JSON.stringify(data)}\n\n`;
+    const chunk = encoder.encode(payload);
+    for (const controller of sseClients) {
+      try {
+        controller.enqueue(chunk);
+      } catch {
+        sseClients.delete(controller);
+      }
+    }
+  };
+
+  const maybeSetPendingRefresh = () => {
+    if (pendingRefresh) return;
+    pendingRefresh = true;
+    broadcast("fs-changed", { pendingRefresh: true });
+  };
+
+  const isHiddenPath = (p: string) =>
+    toPosixPath(p)
+      .split("/")
+      .filter(Boolean)
+      .some((seg) => seg.startsWith("."));
+
+  const isMarkdownPath = (p: string) => {
+    const lower = p.toLowerCase();
+    return lower.endsWith(".md") || lower.endsWith(".markdown");
+  };
+
+  const rescan = async () => {
+    try {
+      const discovered = await discoverMarkdownFiles(config.inputs, {
+        cwd: config.cwd,
+        recursive: config.recursive,
+        includeHidden: config.includeHidden,
+        strict: false,
+      });
+      for (const abs of discovered) absoluteFiles.add(abs);
+      allowedFiles = buildAllowedFiles(config.cwd, absoluteFiles);
+      singleFile = allowedFiles.size === 1;
+      pendingRefresh = false;
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const setupWatchers = async () => {
+    const watchRoots = new Map<string, boolean>();
+
+    const addWatchRoot = (absRoot: string, recursive: boolean) => {
+      const existing = watchRoots.get(absRoot);
+      if (existing === true) return;
+      if (existing === false && recursive === false) return;
+      watchRoots.set(absRoot, recursive || existing === true);
+    };
+
+    const isGlobPattern = (input: string) => /[*?[\]{}()!]/.test(input);
+    const globBaseDir = (pattern: string) => {
+      const idx = pattern.search(/[*?[\]{}()!]/);
+      const prefix = idx === -1 ? pattern : pattern.slice(0, idx);
+      const normalized = toPosixPath(prefix);
+      const lastSlash = normalized.lastIndexOf("/");
+      const base = lastSlash === -1 ? "." : normalized.slice(0, lastSlash);
+      return base || ".";
+    };
+
+    for (const input of config.inputs) {
+      if (isGlobPattern(input)) {
+        const base = globBaseDir(input);
+        addWatchRoot(resolve(config.cwd, base), input.includes("**"));
+        continue;
+      }
+
+      const abs = resolve(config.cwd, input);
+      try {
+        const lst = await lstat(abs);
+        if (lst.isDirectory()) {
+          addWatchRoot(abs, Boolean(config.recursive));
+        } else {
+          addWatchRoot(dirname(abs), false);
+        }
+      } catch {
+        // ignore missing inputs for watch purposes
+      }
+    }
+
+    if (watchRoots.size === 0) addWatchRoot(config.cwd, Boolean(config.recursive));
+
+    for (const [absRoot, recursive] of watchRoots.entries()) {
+      try {
+        const w = watch(
+          absRoot,
+          { recursive },
+          (_event, filename: string | Buffer | null) => {
+            const name = filename
+              ? typeof filename === "string"
+                ? filename
+                : filename.toString()
+              : null;
+
+            if (!name) return void maybeSetPendingRefresh();
+            if (!config.includeHidden && isHiddenPath(name)) return;
+
+            const absPath = resolve(absRoot, name);
+            const relPath = toPosixPath(relative(config.cwd, absPath));
+
+            if (allowedFiles.has(relPath)) {
+              broadcast("file-changed", { path: relPath });
+              return;
+            }
+
+            if (isMarkdownPath(absPath)) maybeSetPendingRefresh();
+          }
+        );
+
+        w.on("error", () => {});
+      } catch {
+        // ignore watch errors (e.g. unsupported recursive mode)
+      }
+    }
+  };
+
+  void setupWatchers();
+
   const server = Bun.serve({
     port,
     routes: {
       "/": index,
-      "/health": {
-        GET: () => Response.json({ ok: true }),
+      "/api/files": {
+        GET: async (req) => {
+          const url = new URL(req.url);
+          const shouldRefresh =
+            url.searchParams.get("refresh") === "true" ||
+            url.searchParams.get("refresh") === "1";
+
+          if (shouldRefresh) {
+            const ok = await rescan();
+            if (ok) broadcast("fs-changed", { pendingRefresh: false });
+          }
+
+          const files: ApiFile[] = [];
+          for (const [relPath, absPath] of allowedFiles.entries()) {
+            const name = basename(absPath);
+            try {
+              const lst = await lstat(absPath);
+              const st = await stat(absPath);
+              files.push({
+                path: relPath,
+                name,
+                mtimeMs: st.mtimeMs,
+                isSymlink: lst.isSymbolicLink(),
+              });
+            } catch (error) {
+              files.push({
+                path: relPath,
+                name,
+                error: (error as Error).message || "Failed to stat file",
+              });
+            }
+          }
+          return Response.json({
+            cwd: config.cwd,
+            singleFile,
+            pendingRefresh,
+            files,
+          });
+        },
       },
       "/api/file": {
         GET: async (req) => {
-          const validation = validateFilePath(getFileParam(req));
-          if ("error" in validation) {
-            return Response.json({ error: validation.error }, { status: 400 });
+          const url = new URL(req.url);
+          const requestedPath = url.searchParams.get("path") || undefined;
+
+          const relPath = requestedPath ?? (singleFile ? [...allowedFiles.keys()][0] : undefined);
+          if (!relPath) {
+            return Response.json(
+              { error: "Missing required query param: path" },
+              { status: 400 }
+            );
+          }
+
+          const absPath = allowedFiles.get(relPath);
+          if (!absPath) {
+            return Response.json({ error: "File not allowed" }, { status: 403 });
           }
 
           try {
-            const file = Bun.file(validation.path);
+            const file = Bun.file(absPath);
             const exists = await file.exists();
             if (!exists) {
               return Response.json(
@@ -55,7 +247,7 @@ export function startServer(port: number = 3000) {
               );
             }
             const content = await file.text();
-            return Response.json({ content, filename: validation.filename });
+            return Response.json({ content, filename: basename(absPath), path: relPath });
           } catch (error) {
             return Response.json(
               { error: "Failed to read file" },
@@ -64,9 +256,20 @@ export function startServer(port: number = 3000) {
           }
         },
         PUT: async (req) => {
-          const validation = validateFilePath(getFileParam(req));
-          if ("error" in validation) {
-            return Response.json({ error: validation.error }, { status: 400 });
+          const url = new URL(req.url);
+          const requestedPath = url.searchParams.get("path") || undefined;
+
+          const relPath = requestedPath ?? (singleFile ? [...allowedFiles.keys()][0] : undefined);
+          if (!relPath) {
+            return Response.json(
+              { error: "Missing required query param: path" },
+              { status: 400 }
+            );
+          }
+
+          const absPath = allowedFiles.get(relPath);
+          if (!absPath) {
+            return Response.json({ error: "File not allowed" }, { status: 403 });
           }
 
           try {
@@ -78,7 +281,7 @@ export function startServer(port: number = 3000) {
                 { status: 400 }
               );
             }
-            await Bun.write(validation.path, content);
+            await Bun.write(absPath, content);
             return Response.json({ success: true });
           } catch (error) {
             return Response.json(
@@ -162,6 +365,48 @@ export function startServer(port: number = 3000) {
               { status: 500 }
             );
           }
+        },
+      },
+      "/api/watch": {
+        GET: () => {
+          let controllerRef: ReadableStreamDefaultController<Uint8Array> | null =
+            null;
+          let interval: ReturnType<typeof setInterval> | null = null;
+
+          const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controllerRef = controller;
+              sseClients.add(controller);
+              controller.enqueue(encoder.encode(`event: ready\ndata: {}\n\n`));
+              if (pendingRefresh) {
+                controller.enqueue(
+                  encoder.encode(
+                    `event: fs-changed\ndata: ${JSON.stringify({ pendingRefresh: true })}\n\n`
+                  )
+                );
+              }
+              interval = setInterval(() => {
+                try {
+                  controller.enqueue(encoder.encode(`: ping\n\n`));
+                } catch {
+                  if (interval) clearInterval(interval);
+                  sseClients.delete(controller);
+                }
+              }, 15000);
+            },
+            cancel(_reason) {
+              if (controllerRef) sseClients.delete(controllerRef);
+              if (interval) clearInterval(interval);
+            },
+          });
+
+          return new Response(stream, {
+            headers: {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+            },
+          });
         },
       },
     },
