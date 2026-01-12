@@ -1,6 +1,6 @@
 {
   "name": "lmv",
-  "version": "v0.2.0",
+  "version": "0.2.0",
   "description": "Local Markdown Viewer - view and edit markdown files in your browser",
   "module": "src/cli.ts",
   "type": "module",
