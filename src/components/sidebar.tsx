@@ -83,14 +83,14 @@ export function Sidebar({
 
 	useEffect(() => {
 		if (!cursorPath && visible.length > 0) {
-			onCursorPathChange(visible[0]?.node.path);
+			onCursorPathChange(visible[0]?.node.path ?? null);
 		}
 	}, [cursorPath, visible, onCursorPathChange]);
 
 	useEffect(() => {
 		const visiblePaths = new Set(visible.map((v) => v.node.path));
 		if (cursorPath && !visiblePaths.has(cursorPath)) {
-			onCursorPathChange(visible.length > 0 ? visible[0]?.node.path : null);
+			onCursorPathChange(visible[0]?.node.path ?? null);
 		}
 	}, [cursorPath, visible, onCursorPathChange]);
 
@@ -128,6 +128,7 @@ export function Sidebar({
 
 		if (e.key === "Enter") {
 			const current = visible[Math.max(idx, 0)]?.node;
+			if (!current) return;
 			if (current.kind === "folder") toggleFolder(current.path);
 			else onOpenPath(current.path);
 		}
