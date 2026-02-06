@@ -11,6 +11,8 @@ import {
 	Save,
 	Share2,
 	Sun,
+	Timer,
+	TimerOff,
 	X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -177,6 +179,10 @@ export function App() {
 	const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
 		new Set(),
 	);
+	const [autosave, setAutosave] = useState(() => {
+		const stored = localStorage.getItem("lmv-autosave");
+		return stored !== null ? stored === "true" : true;
+	});
 	const { theme, setTheme } = useTheme();
 	const { toasts, addToast, removeToast } = useToast();
 
@@ -401,6 +407,18 @@ export function App() {
 	useEffect(() => {
 		localStorage.setItem("lmv-sort-order", sortOrder);
 	}, [sortOrder]);
+
+	useEffect(() => {
+		localStorage.setItem("lmv-autosave", String(autosave));
+	}, [autosave]);
+
+	useEffect(() => {
+		if (!autosave || !isEditing || !hasChanges || !selectedPath) return;
+		const timer = setTimeout(() => {
+			handleSave();
+		}, 1000);
+		return () => clearTimeout(timer);
+	}, [autosave, isEditing, hasChanges, selectedPath, editedContent, handleSave]);
 
 	useEffect(() => {
 		const handler = (e: KeyboardEvent) => {
@@ -660,32 +678,54 @@ export function App() {
 
 							{/* Save button */}
 							{isEditing && (
-								<Tooltip>
-									<TooltipTrigger asChild>
-										<Button
-											size="sm"
-											onClick={handleSave}
-											disabled={!selectedPath || !hasChanges || isSaving}
-											className={cn(
-												"transition-all",
-												saveSuccess && "bg-green-600 hover:bg-green-600",
-											)}
-										>
-											{saveSuccess ? (
-												<>
-													<Check className="h-4 w-4" />
-													Saved
-												</>
-											) : (
-												<>
-													<Save className="h-4 w-4" />
-													Save
-												</>
-											)}
-										</Button>
-									</TooltipTrigger>
-									<TooltipContent>Save changes (Cmd+S)</TooltipContent>
-								</Tooltip>
+								<>
+									<Tooltip>
+										<TooltipTrigger asChild>
+											<Button
+												size="sm"
+												onClick={handleSave}
+												disabled={!selectedPath || !hasChanges || isSaving}
+												className={cn(
+													"transition-all",
+													saveSuccess && "bg-green-600 hover:bg-green-600",
+												)}
+											>
+												{saveSuccess ? (
+													<>
+														<Check className="h-4 w-4" />
+														Saved
+													</>
+												) : (
+													<>
+														<Save className="h-4 w-4" />
+														Save
+													</>
+												)}
+											</Button>
+										</TooltipTrigger>
+										<TooltipContent>Save changes (Cmd+S)</TooltipContent>
+									</Tooltip>
+
+									<Tooltip>
+										<TooltipTrigger asChild>
+											<Toggle
+												variant="outline"
+												pressed={autosave}
+												onPressedChange={setAutosave}
+												aria-label="Toggle autosave"
+											>
+												{autosave ? (
+													<Timer className="h-4 w-4" />
+												) : (
+													<TimerOff className="h-4 w-4" />
+												)}
+											</Toggle>
+										</TooltipTrigger>
+										<TooltipContent>
+											{autosave ? "Autosave on" : "Autosave off"}
+										</TooltipContent>
+									</Tooltip>
+								</>
 							)}
 						</div>
 					</div>
